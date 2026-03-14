@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Text Simplifier — Review</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+
+    <!-- Header bar -->
+    <div class="header-bar">
+      <span class="section-label">Section: {{ section }}</span>
+      <span class="chunk-counter">Chunk {{ chunk_index + 1 }} of {{ total }}</span>
+      <div class="nav-buttons">
+        {% if chunk_index > 0 %}
+          <a href="/review/{{ chunk_index - 1 }}" class="btn btn-nav">◀ Prev</a>
+        {% endif %}
+        {% if chunk_index + 1 < total %}
+          <a href="/review/{{ chunk_index + 1 }}" class="btn btn-nav">Next ▶</a>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Original text with highlights -->
+    <div class="panel" id="original-panel">
+      <div class="panel-title">ORIGINAL TEXT</div>
+      <div class="original-text" id="original-text">{{ chunk.original }}</div>
+      <div class="tier-legend" id="tier-legend"></div>
+    </div>
+
+    <!-- Loading state -->
+    <div id="loading-panel" class="panel loading-panel" style="display:none;">
+      <div class="spinner"></div>
+      <span>Analyzing chunk with LLM…</span>
+    </div>
+
+    <!-- Error state -->
+    <div id="error-panel" class="panel error-panel" style="display:none;">
+      <div class="panel-title">Error</div>
+      <div id="error-message"></div>
+      <button class="btn btn-retry" onclick="loadFlags()">Retry</button>
+    </div>
+
+    <!-- Flags table -->
+    <div class="panel" id="flags-panel" style="display:none;">
+      <div class="panel-title">FLAGGED ITEMS</div>
+      <table class="flags-table">
+        <thead>
+          <tr>
+            <th>Span</th>
+            <th>Tier</th>
+            <th>Suggestion</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="flags-tbody"></tbody>
+      </table>
+    </div>
+
+    <!-- Preview -->
+    <div class="panel" id="preview-panel" style="display:none;">
+      <div class="panel-title">PREVIEW <span class="preview-note">(live — updates as actions are taken)</span></div>
+      <div class="preview-text" id="preview-text"></div>
+    </div>
+
+    <!-- No flags notice -->
+    <div id="no-flags-panel" class="panel no-flags-panel" style="display:none;">
+      <span>✓ No flags — chunk complete</span>
+    </div>
+
+    <!-- Action bar -->
+    <div class="action-bar" id="action-bar" style="display:none;">
+      <button class="btn btn-complete" id="complete-btn" disabled onclick="completeChunk()">
+        Complete Chunk →
+      </button>
+      <button class="btn btn-auto" onclick="confirmAutoComplete()">
+        Auto-complete rest…
+      </button>
+    </div>
+
+  </div>
+
+  <script>
+    const CHUNK_INDEX = {{ chunk_index }};
+    const TOTAL = {{ total }};
+    const ORIGINAL_TEXT = {{ chunk.original | tojson }};
+
+    let flags = [];
+    let preview = ORIGINAL_TEXT;
+
+    // ─── Initialise ────────────────────────────────────────────────────────────
+
+    document.addEventListener("DOMContentLoaded", () => {
+      {% if chunk.status == 'complete' %}
+        // Already complete — just show original with note
+        document.getElementById("original-text").textContent = ORIGINAL_TEXT;
+        showNoFlags("Chunk already complete.");
+      {% else %}
+        loadFlags();
+      {% endif %}
+    });
+
+    // ─── Load flags from API ────────────────────────────────────────────────────
+
+    async function loadFlags() {
+      setPanel("loading");
+      try {
+        const resp = await fetch(`/api/flags/${CHUNK_INDEX}`);
+        const data = await resp.json();
+
+        if (!resp.ok) {
+          showError(data.error || "Unknown error", data.type);
+          return;
+        }
+
+        if (data.flag_error) {
+          showError("LLM returned malformed JSON for this chunk.", "parse");
+          return;
+        }
+
+        flags = data.flags || [];
+
+        if (flags.length === 0) {
+          // Auto-complete
+          await fetch(`/api/complete/${CHUNK_INDEX}`, { method: "POST" });
+          showNoFlags("No flags — chunk complete");
+          setTimeout(() => advanceChunk(), 1500);
+          return;
+        }
+
+        renderFlags();
+        setPanel("flags");
+        updatePreview();
+        checkComplete();
+      } catch (e) {
+        showError("Network error: " + e.message, "network");
+      }
+    }
+
+    // ─── Render flags table ─────────────────────────────────────────────────────
+
+    function renderFlags() {
+      const tbody = document.getElementById("flags-tbody");
+      tbody.innerHTML = "";
+
+      const legend = document.getElementById("tier-legend");
+      const tierSpans = {};
+
+      flags.forEach((flag, i) => {
+        if (flag.flag_error) return;
+
+        const tier = flag.tier || "green";
+        const emoji = tierEmoji(tier);
+        tierSpans[tier] = (tierSpans[tier] || []);
+        tierSpans[tier].push(flag.span);
+
+        const tr = document.createElement("tr");
+        tr.id = `row-${i}`;
+        tr.dataset.span = flag.span;
+        tr.dataset.tier = tier;
+
+        tr.innerHTML = `
+          <td class="span-cell" title="${escHtml(flag.reason || '')}">${escHtml(flag.span)}</td>
+          <td class="tier-cell">${emoji}</td>
+          <td class="suggestion-cell" id="sug-${i}">
+            <span class="suggestion-text">${escHtml(flag.suggestion || "")}</span>
+          </td>
+          <td class="action-cell" id="act-${i}">
+            ${renderActionButtons(i, flag)}
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      // Build inline highlights in original text
+      renderHighlights(tierSpans);
+
+      // Legend
+      const legendParts = [];
+      Object.entries(tierSpans).forEach(([tier, spans]) => {
+        spans.forEach(s => legendParts.push(`${tierEmoji(tier)} ${s}`));
+      });
+      legend.textContent = legendParts.join("    ");
+
+      document.getElementById("flags-panel").style.display = "";
+      document.getElementById("preview-panel").style.display = "";
+      document.getElementById("action-bar").style.display = "";
+    }
+
+    function renderActionButtons(i, flag) {
+      const action = flag.action || "pending";
+      if (action !== "pending") {
+        return `<span class="action-done action-${action}">${actionLabel(action)}</span>
+                <button class="btn-icon" title="Undo" onclick="undoAction(${i})">↩</button>`;
+      }
+      return `
+        <button class="btn-icon btn-approve" title="Approve" onclick="doAction(${i}, 'approved', null)">✓</button>
+        <button class="btn-icon btn-reject"  title="Reject"  onclick="doReject(${i})">✗</button>
+        <button class="btn-icon btn-edit"    title="Edit"    onclick="doEdit(${i})">✏️</button>
+        <button class="btn-icon btn-skip"    title="Skip"    onclick="doAction(${i}, 'skipped', null)">⏭️</button>
+        <button class="btn-icon btn-flag"    title="Flag"    onclick="doAction(${i}, 'flagged', null)">🚩</button>
+      `;
+    }
+
+    // ─── Actions ────────────────────────────────────────────────────────────────
+
+    async function doAction(i, action, finalText) {
+      const flag = flags[i];
+      if (!flag) return;
+
+      let ft = finalText;
+      if (ft === null) {
+        if (action === "approved") ft = flag.suggestion || flag.span;
+        else ft = flag.span;
+      }
+
+      flag.action = action;
+      flag.final_text = ft;
+
+      const resp = await fetch("/api/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chunk_index: CHUNK_INDEX,
+          span: flag.span,
+          action,
+          final_text: ft,
+        }),
+      });
+      const data = await resp.json();
+      if (data.preview) {
+        preview = data.preview;
+        document.getElementById("preview-text").textContent = preview;
+      }
+
+      document.getElementById(`act-${i}`).innerHTML = renderActionButtons(i, flag);
+      checkComplete();
+    }
+
+    async function doReject(i) {
+      const flag = flags[i];
+      const cell = document.getElementById(`sug-${i}`);
+      cell.innerHTML = `<span class="spinner-sm"></span>`;
+
+      const resp = await fetch(`/api/suggest/${CHUNK_INDEX}/${encodeURIComponent(flag.span)}`, {
+        method: "POST",
+      });
+      const data = await resp.json();
+      flag.suggestion = data.suggestion || "";
+      cell.innerHTML = `<span class="suggestion-text">${escHtml(flag.suggestion)}</span>`;
+
+      // Mark as pending so user can approve the new suggestion
+      flag.action = "pending";
+      document.getElementById(`act-${i}`).innerHTML = renderActionButtons(i, flag);
+    }
+
+    function doEdit(i) {
+      const flag = flags[i];
+      const cell = document.getElementById(`act-${i}`);
+      cell.innerHTML = `
+        <input class="edit-input" id="edit-input-${i}" value="${escHtml(flag.suggestion || flag.span)}" />
+        <button class="btn-icon btn-approve" onclick="confirmEdit(${i})">✓</button>
+      `;
+      document.getElementById(`edit-input-${i}`).focus();
+      document.getElementById(`edit-input-${i}`).addEventListener("keydown", e => {
+        if (e.key === "Enter") confirmEdit(i);
+      });
+    }
+
+    async function confirmEdit(i) {
+      const input = document.getElementById(`edit-input-${i}`);
+      const val = input ? input.value.trim() : "";
+      await doAction(i, "edited", val);
+    }
+
+    async function undoAction(i) {
+      const flag = flags[i];
+      flag.action = "pending";
+      flag.final_text = null;
+      document.getElementById(`act-${i}`).innerHTML = renderActionButtons(i, flag);
+
+      // Re-send pending to server
+      await fetch("/api/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chunk_index: CHUNK_INDEX,
+          span: flag.span,
+          action: "pending",
+          final_text: null,
+        }),
+      });
+      checkComplete();
+      updatePreview();
+    }
+
+    // ─── Complete chunk ─────────────────────────────────────────────────────────
+
+    function checkComplete() {
+      const allDone = flags.every(f => f.flag_error || (f.action && f.action !== "pending"));
+      document.getElementById("complete-btn").disabled = !allDone;
+    }
+
+    async function completeChunk() {
+      const resp = await fetch(`/api/complete/${CHUNK_INDEX}`, { method: "POST" });
+      const data = await resp.json();
+      if (data.done) {
+        // Export and show done
+        await fetch("/api/export", { method: "POST" });
+        document.body.innerHTML = `<div class="done-screen"><h1>All chunks complete!</h1><p>Output has been exported.</p></div>`;
+      } else {
+        window.location.href = `/review/${data.next}`;
+      }
+    }
+
+    function advanceChunk() {
+      if (CHUNK_INDEX + 1 < TOTAL) {
+        window.location.href = `/review/${CHUNK_INDEX + 1}`;
+      }
+    }
+
+    // ─── Auto-complete rest ─────────────────────────────────────────────────────
+
+    async function confirmAutoComplete() {
+      if (!confirm("Auto-complete all remaining chunks?\n\nRed/yellow flags will be auto-approved; green flags will be skipped.")) return;
+      document.body.innerHTML = `<div class="done-screen"><div class="spinner"></div><p>Auto-completing remaining chunks…</p></div>`;
+      await fetch("/api/auto_complete_rest", { method: "POST" });
+      document.body.innerHTML = `<div class="done-screen"><h1>Auto-complete done!</h1><p>Output has been exported.</p></div>`;
+    }
+
+    // ─── Preview ────────────────────────────────────────────────────────────────
+
+    function updatePreview() {
+      document.getElementById("preview-text").textContent = preview;
+    }
+
+    // ─── Highlights in original text ────────────────────────────────────────────
+
+    function renderHighlights(tierSpans) {
+      let html = escHtml(ORIGINAL_TEXT);
+      Object.entries(tierSpans).forEach(([tier, spans]) => {
+        spans.forEach(span => {
+          const escaped = escHtml(span);
+          const cls = `highlight-${tier}`;
+          html = html.split(escaped).join(`<mark class="${cls}">${escaped}</mark>`);
+        });
+      });
+      document.getElementById("original-text").innerHTML = html;
+    }
+
+    // ─── UI helpers ─────────────────────────────────────────────────────────────
+
+    function setPanel(state) {
+      document.getElementById("loading-panel").style.display = state === "loading" ? "" : "none";
+      document.getElementById("error-panel").style.display = state === "error" ? "" : "none";
+      document.getElementById("flags-panel").style.display = state === "flags" ? "" : "none";
+      document.getElementById("no-flags-panel").style.display = state === "no-flags" ? "" : "none";
+    }
+
+    function showError(msg, type) {
+      let extra = "";
+      if (type === "connection") extra = "<br><small>Make sure Ollama is running: <a href='https://ollama.ai' target='_blank'>ollama.ai</a></small>";
+      if (type === "model") extra = "<br><small>Try: <code>ollama pull &lt;model&gt;</code></small>";
+      document.getElementById("error-message").innerHTML = escHtml(msg) + extra;
+      setPanel("error");
+    }
+
+    function showNoFlags(msg) {
+      document.getElementById("no-flags-panel").textContent = msg;
+      document.getElementById("no-flags-panel").style.display = "";
+      document.getElementById("loading-panel").style.display = "none";
+      document.getElementById("flags-panel").style.display = "none";
+    }
+
+    function tierEmoji(tier) {
+      return tier === "red" ? "🔴" : tier === "yellow" ? "🟡" : "🟢";
+    }
+
+    function actionLabel(action) {
+      const map = { approved: "✓ Approved", rejected: "✗ Rejected", edited: "✏️ Edited", skipped: "⏭️ Skipped", flagged: "🚩 Flagged" };
+      return map[action] || action;
+    }
+
+    function escHtml(str) {
+      if (!str) return "";
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+[project]
+name = "simplify"
+version = "0.1.0"
+description = "Interactive text simplification tool using a local Ollama LLM"
+requires-python = ">=3.11"
+dependencies = [
+    "flask",
+    "ollama",
+    "nltk",
+    "rich",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
