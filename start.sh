@@ -71,7 +71,7 @@ fi
 
 # ── 5. Python dependencies via uv ─────────────────────────────────────────────
 echo "→ Syncing Python dependencies..."
-uv sync --quiet
+uv sync --no-install-project --quiet
 ok "Dependencies ready."
 
 # ── 6. Launch ────────────────────────────────────────────────────────────────

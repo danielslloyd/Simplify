@@ -75,7 +75,7 @@ if errorlevel 1 (
 
 :: ── 5. Python dependencies via uv ────────────────────────────────────────────
 echo ^> Syncing Python dependencies...
-uv sync --quiet
+uv sync --no-install-project --quiet
 if errorlevel 1 (
     echo [ERROR] Dependency sync failed.
     pause
