@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Text Simplifier — Setup</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container setup-container">
+
+    <div class="header-bar">
+      <span class="section-label">Text Simplifier</span>
+      <span id="step-indicator" style="color:#aaa;font-size:0.85rem">Setup</span>
+    </div>
+
+    <!-- Step 1: File & Settings -->
+    <div class="panel" id="step-settings">
+      <div class="panel-title">Settings</div>
+
+      <div class="setup-field">
+        <label>Input file</label>
+        <div class="file-row">
+          <input type="file" id="file-input" accept=".txt,.md,.text,*" />
+          <div class="file-name-display" id="file-name-display">No file selected</div>
+          <button class="btn" onclick="document.getElementById('file-input').click()">Browse…</button>
+        </div>
+      </div>
+
+      <div class="setup-field">
+        <label>Ollama model</label>
+        <input type="text" id="model-input" value="llama3" placeholder="llama3" />
+      </div>
+
+      <div class="setup-field">
+        <label>Target reading grade level</label>
+        <input type="number" id="grade-input" value="6" min="1" max="16" />
+      </div>
+
+      <div class="setup-field">
+        <label>Output path <span class="field-note">(auto-generated from filename if left blank)</span></label>
+        <input type="text" id="output-input" placeholder="./output/myfile_simplified" />
+      </div>
+
+      <div class="setup-field">
+        <label>Sentences per chunk</label>
+        <input type="number" id="spc-input" value="5" min="1" max="30" />
+      </div>
+
+      <div id="step1-error" class="setup-error" style="display:none"></div>
+
+      <div class="setup-actions">
+        <button class="btn btn-primary" onclick="analyzeFile()">Analyze File →</button>
+      </div>
+    </div>
+
+    <!-- Loading -->
+    <div class="panel loading-panel" id="loading-panel" style="display:none">
+      <div class="spinner"></div>
+      <span>Analyzing file…</span>
+    </div>
+
+    <!-- Step 2: Resume existing session -->
+    <div class="panel" id="step-resume" style="display:none">
+      <div class="panel-title">Resume Session?</div>
+      <div class="resume-box">
+        <p id="resume-msg"></p>
+        <div class="resume-progress">
+          <div class="progress-bar"><div class="progress-fill" id="resume-progress-fill"></div></div>
+        </div>
+        <div class="setup-actions" style="justify-content:center">
+          <button class="btn btn-primary" onclick="doResume()">Resume →</button>
+          <button class="btn" onclick="showBoilerplateStep()">Start Fresh</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 3: Boilerplate -->
+    <div class="panel" id="step-boilerplate" style="display:none">
+      <div class="panel-title">Boilerplate Detection</div>
+      <div id="boilerplate-content"></div>
+      <div class="setup-actions">
+        <button class="btn btn-primary" onclick="goToPatternStep()">Continue →</button>
+      </div>
+    </div>
+
+    <!-- Step 4: Pattern -->
+    <div class="panel" id="step-pattern" style="display:none">
+      <div class="panel-title">Section Structure</div>
+      <div id="pattern-content"></div>
+      <div id="pattern-error" class="setup-error" style="display:none"></div>
+      <div class="setup-actions">
+        <button class="btn btn-primary" onclick="startSession()">Start Reviewing →</button>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    let setupData = null;
+    let selectedPattern = null;
+    let stripHeader = false;
+    let stripFooter = false;
+    let selectedLogic = "OR";
+
+    // ── File picker ────────────────────────────────────────────────────────────
+
+    document.getElementById("file-input").addEventListener("change", function () {
+      const file = this.files[0];
+      if (!file) return;
+      document.getElementById("file-name-display").textContent = file.name;
+      const outputField = document.getElementById("output-input");
+      if (!outputField.value) {
+        const basename = file.name.replace(/\.[^/.]+$/, "");
+        outputField.value = `./output/${basename}_simplified`;
+      }
+    });
+
+    // ── Step 1: Analyze ────────────────────────────────────────────────────────
+
+    async function analyzeFile() {
+      const fileInput = document.getElementById("file-input");
+      const errEl = document.getElementById("step1-error");
+      errEl.style.display = "none";
+
+      if (!fileInput.files[0]) {
+        errEl.textContent = "Please select a file.";
+        errEl.style.display = "";
+        return;
+      }
+
+      const model = document.getElementById("model-input").value.trim();
+      if (!model) {
+        errEl.textContent = "Please enter a model name.";
+        errEl.style.display = "";
+        return;
+      }
+
+      showLoading();
+
+      const formData = new FormData();
+      formData.append("file", fileInput.files[0]);
+      formData.append("model", model);
+      formData.append("grade", document.getElementById("grade-input").value);
+      formData.append("output_path", document.getElementById("output-input").value.trim());
+      formData.append("sentences_per_chunk", document.getElementById("spc-input").value);
+
+      try {
+        const resp = await fetch("/api/setup", { method: "POST", body: formData });
+        const data = await resp.json();
+        hideLoading();
+
+        if (!resp.ok) {
+          errEl.textContent = data.error || "Analysis failed.";
+          errEl.style.display = "";
+          showStep("step-settings");
+          return;
+        }
+
+        setupData = data;
+        if (data.output_path) {
+          const f = document.getElementById("output-input");
+          if (!f.value) f.value = data.output_path;
+        }
+
+        if (data.existing_session) {
+          showResumeStep(data.existing_session);
+        } else {
+          showBoilerplateStep();
+        }
+      } catch (e) {
+        hideLoading();
+        errEl.textContent = "Network error: " + e.message;
+        errEl.style.display = "";
+        showStep("step-settings");
+      }
+    }
+
+    // ── Step 2: Resume ─────────────────────────────────────────────────────────
+
+    function showResumeStep(existing) {
+      const pct = existing.total > 0 ? Math.round((existing.completed / existing.total) * 100) : 0;
+      document.getElementById("resume-msg").innerHTML =
+        `Existing session found: <strong>${existing.completed} of ${existing.total} chunks complete</strong> (${pct}%).`;
+      document.getElementById("resume-progress-fill").style.width = pct + "%";
+      showStep("step-resume");
+    }
+
+    async function doResume() {
+      showLoading();
+      const resp = await fetch("/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: document.getElementById("model-input").value.trim(),
+          grade: parseInt(document.getElementById("grade-input").value),
+          output_path: document.getElementById("output-input").value.trim() || setupData.output_path,
+          sentences_per_chunk: parseInt(document.getElementById("spc-input").value),
+          resume: true,
+        }),
+      });
+      const data = await resp.json();
+      hideLoading();
+      if (data.ok) {
+        window.location.href = "/";
+      } else {
+        alert(data.error || "Failed to resume session.");
+      }
+    }
+
+    // ── Step 3: Boilerplate ────────────────────────────────────────────────────
+
+    function showBoilerplateStep() {
+      if (!setupData) return;
+      const bp = setupData.boilerplate || {};
+      stripHeader = false;
+      stripFooter = false;
+
+      if (!bp.header && !bp.footer) {
+        showPatternStep();
+        return;
+      }
+
+      let html = "";
+
+      if (bp.header) {
+        html += `<div class="bp-region">
+          <div class="bp-label">Possible header detected (lines ${bp.header.start + 1}–${bp.header.end + 1}):</div>
+          <div class="bp-preview">${escHtml(bp.header.preview.join("\n"))}</div>
+          <label class="bp-toggle">
+            <input type="checkbox" id="strip-header" onchange="stripHeader=this.checked" />
+            Strip this header
+          </label>
+        </div>`;
+      }
+
+      if (bp.footer) {
+        html += `<div class="bp-region">
+          <div class="bp-label">Possible footer detected (lines ${bp.footer.start + 1}–${bp.footer.end + 1}):</div>
+          <div class="bp-preview">${escHtml(bp.footer.preview.join("\n"))}</div>
+          <label class="bp-toggle">
+            <input type="checkbox" id="strip-footer" onchange="stripFooter=this.checked" />
+            Strip this footer
+          </label>
+        </div>`;
+      }
+
+      document.getElementById("boilerplate-content").innerHTML = html;
+      showStep("step-boilerplate");
+    }
+
+    function goToPatternStep() {
+      const hc = document.getElementById("strip-header");
+      const fc = document.getElementById("strip-footer");
+      if (hc) stripHeader = hc.checked;
+      if (fc) stripFooter = fc.checked;
+      showPatternStep();
+    }
+
+    // ── Step 4: Pattern ────────────────────────────────────────────────────────
+
+    function showPatternStep() {
+      if (!setupData) return;
+      const patterns = setupData.patterns || {};
+      const signals = setupData.signals || {};
+      const patternNames = Object.keys(patterns);
+      const activeSignals = Object.entries(signals).filter(([, v]) => v.count > 0);
+      let html = "";
+
+      if (patternNames.length > 0) {
+        html += `<div class="pattern-list">`;
+        patternNames.forEach((name, i) => {
+          const p = patterns[name];
+          html += `<div class="pattern-option" id="pat-${i}" onclick="selectKnownPattern(${i})">
+            <div class="pattern-radio" id="prad-${i}"></div>
+            <div>
+              <strong>${escHtml(name)}</strong>
+              <span class="pattern-meta"> — ${p.logic}(${escHtml(p.signals.join(", "))}) — ${p.match_count} match${p.match_count !== 1 ? "es" : ""}</span>
+            </div>
+          </div>`;
+        });
+        html += `<div class="pattern-option" id="pat-new" onclick="selectNewPattern()">
+          <div class="pattern-radio" id="prad-new"></div>
+          <div style="color:#555">Define new pattern for this file…</div>
+        </div></div>`;
+
+        html += `<div id="new-pattern-builder" style="display:none;margin-top:14px">`;
+      } else {
+        html += `<div class="setup-note">No saved patterns found. Define how to split the text into sections:</div>`;
+        html += `<div id="new-pattern-builder">`;
+      }
+
+      if (activeSignals.length > 0) {
+        html += `<div class="signal-list">`;
+        activeSignals.forEach(([id, info]) => {
+          const samplesHtml = info.samples.map(s =>
+            `<span class="signal-sample">→ "${escHtml(s)}"</span>`
+          ).join("");
+          html += `<label class="signal-row">
+            <input type="checkbox" class="signal-cb" value="${escHtml(id)}" onchange="onSignalChange()" />
+            <div>
+              <span class="signal-name">${escHtml(id)}</span>
+              <span class="signal-desc"> — ${escHtml(info.description)} — ${info.count} occurrence${info.count !== 1 ? "s" : ""}</span>
+              <div>${samplesHtml}</div>
+            </div>
+          </label>`;
+        });
+        html += `</div>`;
+
+        html += `<div class="logic-row">
+          <span class="logic-label">Logic:</span>
+          <button class="logic-btn active" id="logic-or"  onclick="setLogic('OR')">OR</button>
+          <button class="logic-btn"        id="logic-and" onclick="setLogic('AND')">AND</button>
+        </div>`;
+
+        html += `<div class="split-preview" id="split-preview">Select signals above to preview split points.</div>`;
+      } else {
+        html += `<div class="setup-note">No structural signals found — entire text will be processed as one section.</div>`;
+        selectedPattern = { logic: "OR", signals: [] };
+      }
+
+      html += `<div class="save-pattern-row">
+        <label class="save-pattern-label">Save pattern as:</label>
+        <input type="text" id="save-pattern-name" class="save-pattern-input" placeholder="(optional)" />
+      </div>`;
+
+      html += `</div>`; // close new-pattern-builder
+
+      document.getElementById("pattern-content").innerHTML = html;
+      document.getElementById("pattern-error").style.display = "none";
+      showStep("step-pattern");
+
+      if (patternNames.length > 0) {
+        selectKnownPattern(0);
+      }
+    }
+
+    function selectKnownPattern(i) {
+      const patterns = setupData.patterns;
+      const name = Object.keys(patterns)[i];
+      const p = patterns[name];
+      selectedPattern = { logic: p.logic, signals: p.signals };
+
+      document.querySelectorAll(".pattern-option").forEach((el, idx) => {
+        const isThis = idx === i;
+        el.classList.toggle("selected", isThis);
+        const radio = el.querySelector(".pattern-radio");
+        if (radio) radio.classList.toggle("checked", isThis);
+      });
+
+      const builder = document.getElementById("new-pattern-builder");
+      if (builder) builder.style.display = "none";
+    }
+
+    function selectNewPattern() {
+      selectedPattern = null;
+      document.querySelectorAll(".pattern-option").forEach(el => {
+        const isNew = el.id === "pat-new";
+        el.classList.toggle("selected", isNew);
+        const radio = el.querySelector(".pattern-radio");
+        if (radio) radio.classList.toggle("checked", isNew);
+      });
+      const builder = document.getElementById("new-pattern-builder");
+      if (builder) builder.style.display = "";
+    }
+
+    function setLogic(logic) {
+      selectedLogic = logic;
+      document.getElementById("logic-or").classList.toggle("active", logic === "OR");
+      document.getElementById("logic-and").classList.toggle("active", logic === "AND");
+      onSignalChange();
+    }
+
+    function onSignalChange() {
+      updateSplitPreview();
+    }
+
+    async function updateSplitPreview() {
+      const preview = document.getElementById("split-preview");
+      if (!preview) return;
+      const checked = Array.from(document.querySelectorAll(".signal-cb:checked")).map(el => el.value);
+      if (checked.length === 0) {
+        preview.textContent = "Select signals above to preview split points.";
+        return;
+      }
+      preview.textContent = "Computing…";
+      try {
+        const resp = await fetch("/api/pattern_preview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pattern: { logic: selectedLogic, signals: checked } }),
+        });
+        const data = await resp.json();
+        let text = `${data.split_count} split point${data.split_count !== 1 ? "s" : ""} detected.`;
+        if (data.samples && data.samples.length > 0) {
+          text += "\n" + data.samples.map(s => `→ "${s}"`).join("\n");
+        }
+        preview.textContent = text;
+      } catch (e) {
+        preview.textContent = "Preview unavailable.";
+      }
+    }
+
+    // ── Start session ──────────────────────────────────────────────────────────
+
+    async function startSession() {
+      const errEl = document.getElementById("pattern-error");
+      errEl.style.display = "none";
+
+      let pattern = selectedPattern;
+      if (!pattern) {
+        const signals = Array.from(document.querySelectorAll(".signal-cb:checked")).map(el => el.value);
+        pattern = { logic: selectedLogic, signals };
+      }
+
+      const savePatternName = (document.getElementById("save-pattern-name")?.value || "").trim();
+
+      showLoading();
+      try {
+        const resp = await fetch("/api/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: document.getElementById("model-input").value.trim(),
+            grade: parseInt(document.getElementById("grade-input").value),
+            output_path: document.getElementById("output-input").value.trim() || setupData.output_path,
+            sentences_per_chunk: parseInt(document.getElementById("spc-input").value),
+            strip_header: stripHeader,
+            strip_footer: stripFooter,
+            pattern,
+            save_pattern_name: savePatternName,
+            resume: false,
+          }),
+        });
+        const data = await resp.json();
+        hideLoading();
+        if (data.ok) {
+          window.location.href = "/";
+        } else {
+          errEl.textContent = data.error || "Failed to start session.";
+          errEl.style.display = "";
+          showStep("step-pattern");
+        }
+      } catch (e) {
+        hideLoading();
+        errEl.textContent = "Network error: " + e.message;
+        errEl.style.display = "";
+        showStep("step-pattern");
+      }
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    function showStep(id) {
+      ["step-settings", "step-resume", "step-boilerplate", "step-pattern"].forEach(s => {
+        const el = document.getElementById(s);
+        if (el) el.style.display = (s === id) ? "" : "none";
+      });
+      document.getElementById("loading-panel").style.display = "none";
+      const labels = {
+        "step-settings": "Settings",
+        "step-resume": "Resume?",
+        "step-boilerplate": "Boilerplate",
+        "step-pattern": "Pattern",
+      };
+      document.getElementById("step-indicator").textContent = labels[id] || "";
+    }
+
+    function showLoading() {
+      ["step-settings", "step-resume", "step-boilerplate", "step-pattern"].forEach(s => {
+        const el = document.getElementById(s);
+        if (el) el.style.display = "none";
+      });
+      document.getElementById("loading-panel").style.display = "";
+    }
+
+    function hideLoading() {
+      document.getElementById("loading-panel").style.display = "none";
+    }
+
+    function escHtml(str) {
+      return String(str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+  </script>
+</body>
+</html>
