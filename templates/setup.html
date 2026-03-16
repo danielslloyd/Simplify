@@ -29,7 +29,9 @@
 
       <div class="setup-field">
         <label>Ollama model</label>
-        <input type="text" id="model-input" value="llama3" placeholder="llama3" />
+        <input type="text" id="model-input" value="" placeholder="Loading…" list="model-list" />
+        <datalist id="model-list"></datalist>
+        <div id="model-hint" style="font-size:0.8rem;color:#999;margin-top:3px"></div>
       </div>
 
       <div class="setup-field">
@@ -102,6 +104,35 @@
     let stripHeader = false;
     let stripFooter = false;
     let selectedLogic = "OR";
+
+    // ── Load available models on page load ────────────────────────────────────
+
+    (async function loadModels() {
+      const input = document.getElementById("model-input");
+      const list  = document.getElementById("model-list");
+      const hint  = document.getElementById("model-hint");
+      try {
+        const resp = await fetch("/api/models");
+        const data = await resp.json();
+        const models = data.models || [];
+        if (models.length > 0) {
+          models.forEach(m => {
+            const opt = document.createElement("option");
+            opt.value = m;
+            list.appendChild(opt);
+          });
+          input.value = models[0];
+          input.placeholder = models[0];
+          hint.textContent = models.length + " model" + (models.length !== 1 ? "s" : "") + " installed";
+        } else {
+          input.placeholder = "e.g. llama3";
+          hint.textContent = "No models found — is Ollama running?";
+          hint.style.color = "#c62828";
+        }
+      } catch (e) {
+        input.placeholder = "e.g. llama3";
+      }
+    })();
 
     // ── File picker ────────────────────────────────────────────────────────────
 

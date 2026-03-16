@@ -52,6 +52,20 @@ def index():
     return redirect(url_for("review", chunk_index=_first_incomplete()))
 
 
+@app.route("/api/models")
+def api_models():
+    """Return the list of models installed in Ollama."""
+    import urllib.request
+    import urllib.error
+    try:
+        with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=3) as r:
+            data = json.loads(r.read())
+        models = [m["name"] for m in data.get("models", [])]
+        return jsonify({"models": models})
+    except Exception:
+        return jsonify({"models": []})
+
+
 @app.route("/setup")
 def setup():
     return render_template("setup.html")
