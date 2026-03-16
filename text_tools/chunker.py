@@ -74,14 +74,6 @@ def chunk_text(
         if remaining_content:
             sections.append((f"Section {section_idx + 1}", remaining_content))
 
-    if len(sections) == 1:
-        from rich.console import Console
-        console = Console()
-        console.print("[yellow]Warning: split rule produced only 1 section.[/yellow]")
-        confirm = input("Continue with entire text as one section? (y/n): ").strip().lower()
-        if confirm != "y":
-            raise SystemExit("Aborted by user.")
-
     # Build chunks
     chunks = []
     global_index = 0

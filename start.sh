@@ -80,4 +80,4 @@ echo "=== Starting Simplify ==="
 echo ""
 
 # pass any arguments through (e.g. --auto)
-uv run python main.py "$@"
+uv run --no-project python main.py "$@"

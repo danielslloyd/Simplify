@@ -15,9 +15,12 @@ from output.writer import save_session, export
 
 app = Flask(__name__)
 
-# Global session state (set by main.py before starting Flask)
+PATTERNS_PATH = os.path.join(os.path.dirname(__file__), "text_tools", "patterns.json")
+
+# Global state
 _session: dict = {}
 _config: dict = {}
+_pending: dict = {}  # Temporary state between /api/setup and /api/start
 
 
 def init_app(session: dict, config: dict) -> None:
@@ -44,7 +47,213 @@ def _first_incomplete() -> int:
 
 @app.route("/")
 def index():
+    if not _session.get("chunks"):
+        return redirect(url_for("setup"))
     return redirect(url_for("review", chunk_index=_first_incomplete()))
+
+
+@app.route("/setup")
+def setup():
+    return render_template("setup.html")
+
+
+@app.route("/api/setup", methods=["POST"])
+def api_setup():
+    global _pending
+
+    # Accept multipart (file upload) or JSON (file path)
+    if request.content_type and "multipart" in request.content_type:
+        file = request.files.get("file")
+        model = request.form.get("model", "llama3")
+        grade_str = request.form.get("grade", "6")
+        output_path = request.form.get("output_path", "").strip()
+        spc_str = request.form.get("sentences_per_chunk", "5")
+        if not file or not file.filename:
+            return jsonify({"error": "No file provided."}), 400
+        filename = file.filename
+        raw_text = file.read().decode("utf-8", errors="replace")
+    else:
+        data = request.get_json() or {}
+        file_path = data.get("file_path", "").strip()
+        model = data.get("model", "llama3")
+        grade_str = str(data.get("grade", "6"))
+        output_path = data.get("output_path", "").strip()
+        spc_str = str(data.get("sentences_per_chunk", "5"))
+        if not file_path or not os.path.exists(file_path):
+            return jsonify({"error": f"File not found: {file_path}"}), 400
+        filename = os.path.basename(file_path)
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            raw_text = f.read()
+
+    if not raw_text.strip():
+        return jsonify({"error": "File is empty."}), 400
+
+    try:
+        grade = int(grade_str)
+        sentences_per_chunk = int(spc_str)
+    except ValueError:
+        return jsonify({"error": "Grade and sentences per chunk must be numbers."}), 400
+
+    if not output_path:
+        basename = os.path.splitext(filename)[0]
+        output_path = f"./output/{basename}_simplified"
+
+    # Boilerplate detection
+    from text_tools.boilerplate import detect_boilerplate
+    regions = detect_boilerplate(raw_text)
+    lines = raw_text.splitlines()
+
+    boilerplate = {}
+    if regions.get("header"):
+        h = regions["header"]
+        boilerplate["header"] = {"start": h[0], "end": h[1], "preview": lines[h[0]:h[1]+1][:20]}
+    if regions.get("footer"):
+        ft = regions["footer"]
+        boilerplate["footer"] = {"start": ft[0], "end": ft[1], "preview": lines[ft[0]:ft[1]+1][:20]}
+
+    # Signals
+    from text_tools.scanner import scan_signals, load_patterns, SIGNALS, _get_split_lines
+    signals = scan_signals(raw_text)
+
+    signals_summary = {}
+    for sig_id, line_nums in signals.items():
+        desc = SIGNALS[sig_id].get("description", sig_id)
+        samples = [lines[ln].strip() for ln in line_nums[:2] if 0 <= ln < len(lines)]
+        signals_summary[sig_id] = {"count": len(line_nums), "description": desc, "samples": samples}
+
+    # Known patterns with match counts
+    patterns_raw = load_patterns(PATTERNS_PATH)
+    patterns_info = {}
+    for name, pat in patterns_raw.items():
+        n = len(_get_split_lines(raw_text, signals, pat))
+        patterns_info[name] = {"logic": pat.get("logic", "OR"), "signals": pat.get("signals", []), "match_count": n}
+
+    # Existing session check
+    from output.writer import load_session
+    existing_session = None
+    sess = load_session(output_path)
+    if sess:
+        completed = sum(1 for c in sess.get("chunks", []) if c.get("status") == "complete")
+        total = sess.get("meta", {}).get("total_chunks", 0)
+        existing_session = {"completed": completed, "total": total}
+
+    _pending = {
+        "raw_text": raw_text,
+        "filename": filename,
+        "signals": signals,
+        "model": model,
+        "grade": grade,
+        "output_path": output_path,
+        "sentences_per_chunk": sentences_per_chunk,
+    }
+
+    return jsonify({
+        "boilerplate": boilerplate,
+        "signals": signals_summary,
+        "patterns": patterns_info,
+        "existing_session": existing_session,
+        "output_path": output_path,
+        "filename": filename,
+    })
+
+
+@app.route("/api/pattern_preview", methods=["POST"])
+def api_pattern_preview():
+    if not _pending.get("raw_text"):
+        return jsonify({"error": "No file loaded."}), 400
+
+    data = request.get_json() or {}
+    pattern = data.get("pattern", {"logic": "OR", "signals": []})
+
+    from text_tools.scanner import _get_split_lines
+    raw_text = _pending["raw_text"]
+    signals = _pending["signals"]
+    lines = raw_text.splitlines()
+
+    split_lines = _get_split_lines(raw_text, signals, pattern)
+    samples = [lines[ln].strip() for ln in split_lines[:5] if 0 <= ln < len(lines)]
+
+    return jsonify({"split_count": len(split_lines), "samples": samples})
+
+
+@app.route("/api/start", methods=["POST"])
+def api_start():
+    global _session, _config
+
+    if not _pending.get("raw_text"):
+        return jsonify({"error": "No file loaded. Please go back to setup."}), 400
+
+    data = request.get_json() or {}
+
+    model = data.get("model") or _pending.get("model", "llama3")
+    grade = int(data.get("grade") or _pending.get("grade", 6))
+    output_path = data.get("output_path") or _pending.get("output_path", "./output/simplified")
+    sentences_per_chunk = int(data.get("sentences_per_chunk") or _pending.get("sentences_per_chunk", 5))
+    strip_header = data.get("strip_header", False)
+    strip_footer = data.get("strip_footer", False)
+    pattern = data.get("pattern", {"logic": "OR", "signals": []})
+    save_pattern_name = (data.get("save_pattern_name") or "").strip()
+    resume = data.get("resume", False)
+
+    # Resume existing session
+    if resume:
+        from output.writer import load_session
+        existing = load_session(output_path)
+        if existing:
+            _session = existing
+            _config = {"model": model, "grade": grade, "output_path": output_path}
+            return jsonify({"ok": True})
+
+    raw_text = _pending["raw_text"]
+
+    # Strip boilerplate
+    from text_tools.boilerplate import detect_boilerplate, strip_boilerplate
+    if strip_header or strip_footer:
+        regions = detect_boilerplate(raw_text)
+        confirmed = {
+            "header": regions.get("header") if strip_header else None,
+            "footer": regions.get("footer") if strip_footer else None,
+        }
+        clean_text = strip_boilerplate(raw_text, confirmed)
+    else:
+        clean_text = raw_text
+
+    # Optionally save pattern
+    if save_pattern_name:
+        from text_tools.scanner import save_pattern
+        from datetime import datetime
+        save_pattern(save_pattern_name, {**pattern, "created": datetime.now().strftime("%Y-%m-%d")}, PATTERNS_PATH)
+
+    # Chunk text
+    from text_tools.chunker import chunk_text
+    from text_tools.scanner import scan_signals
+    signals = scan_signals(clean_text)
+    chunks = chunk_text(clean_text, pattern, sentences_per_chunk=sentences_per_chunk, signals=signals)
+
+    if not chunks:
+        return jsonify({"error": "No chunks produced from this text."}), 400
+
+    filename = _pending.get("filename", "")
+    _session = {
+        "meta": {
+            "input_file": filename,
+            "model": model,
+            "grade": grade,
+            "sentences_per_chunk": sentences_per_chunk,
+            "total_chunks": len(chunks),
+        },
+        "chunks": [],
+    }
+    for chunk in chunks:
+        chunk["flags"] = None
+        chunk["final_text"] = None
+        chunk["status"] = "pending"
+        _session["chunks"].append(chunk)
+
+    _config = {"model": model, "grade": grade, "output_path": output_path}
+    save_session(_session, output_path)
+
+    return jsonify({"ok": True})
 
 
 @app.route("/review/<int:chunk_index>")

@@ -88,7 +88,7 @@ echo.
 echo === Starting Simplify ===
 echo.
 
-uv run python main.py %*
+uv run --no-project python main.py %*
 if errorlevel 1 (
     echo.
     echo [ERROR] Application exited with an error ^(see above^).
