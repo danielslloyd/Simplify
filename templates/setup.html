@@ -44,11 +44,6 @@
         <input type="text" id="output-input" placeholder="./output/myfile_simplified" />
       </div>
 
-      <div class="setup-field">
-        <label>Sentences per chunk</label>
-        <input type="number" id="spc-input" value="5" min="1" max="30" />
-      </div>
-
       <div id="step1-error" class="setup-error" style="display:none"></div>
 
       <div class="setup-actions">
@@ -82,17 +77,27 @@
       <div class="panel-title">Boilerplate Detection</div>
       <div id="boilerplate-content"></div>
       <div class="setup-actions">
+        <button class="btn btn-primary" onclick="goToWhitespaceStep()">Continue →</button>
+      </div>
+    </div>
+
+    <!-- Step 4: Whitespace cleanup -->
+    <div class="panel" id="step-whitespace" style="display:none">
+      <div class="panel-title">Whitespace Cleanup</div>
+      <div id="whitespace-content"></div>
+      <div class="setup-actions">
         <button class="btn btn-primary" onclick="goToPatternStep()">Continue →</button>
       </div>
     </div>
 
-    <!-- Step 4: Pattern -->
+    <!-- Step 5: Pattern -->
     <div class="panel" id="step-pattern" style="display:none">
       <div class="panel-title">Section Structure</div>
       <div id="pattern-content"></div>
       <div id="pattern-error" class="setup-error" style="display:none"></div>
       <div class="setup-actions">
         <button class="btn btn-primary" onclick="startSession()">Start Reviewing →</button>
+        <button class="btn" onclick="editChapters()">Preview &amp; Edit Chapters…</button>
       </div>
     </div>
 
@@ -104,6 +109,7 @@
     let stripHeader = false;
     let stripFooter = false;
     let selectedLogic = "OR";
+    let selectedNormalizations = [];
 
     // ── Load available models on page load ────────────────────────────────────
 
@@ -174,7 +180,7 @@
       formData.append("model", model);
       formData.append("grade", document.getElementById("grade-input").value);
       formData.append("output_path", document.getElementById("output-input").value.trim());
-      formData.append("sentences_per_chunk", document.getElementById("spc-input").value);
+      formData.append("sentences_per_chunk", "1");
 
       try {
         const resp = await fetch("/api/setup", { method: "POST", body: formData });
@@ -226,7 +232,7 @@
           model: document.getElementById("model-input").value.trim(),
           grade: parseInt(document.getElementById("grade-input").value),
           output_path: document.getElementById("output-input").value.trim() || setupData.output_path,
-          sentences_per_chunk: parseInt(document.getElementById("spc-input").value),
+          sentences_per_chunk: 1,
           resume: true,
         }),
       });
@@ -280,11 +286,66 @@
       showStep("step-boilerplate");
     }
 
-    function goToPatternStep() {
+    function goToWhitespaceStep() {
       const hc = document.getElementById("strip-header");
       const fc = document.getElementById("strip-footer");
       if (hc) stripHeader = hc.checked;
       if (fc) stripFooter = fc.checked;
+      showWhitespaceStep();
+    }
+
+    // ── Step 4: Whitespace cleanup ─────────────────────────────────────────────
+
+    function showWhitespaceStep() {
+      if (!setupData) return;
+      const ws = setupData.whitespace || {};
+      const keys = Object.keys(ws);
+
+      if (keys.length === 0) {
+        showPatternStep();
+        return;
+      }
+
+      const labels = {
+        crlf:       "Windows line endings (\\r\\n)",
+        cr:         "Bare carriage returns (\\r)",
+        tabs:       "Tab characters (\\t)",
+        nbsp:       "Non-breaking spaces (\\u00a0)",
+        zero_width: "Zero-width / invisible characters",
+      };
+
+      let html = `<div class="setup-note">The following whitespace issues were found. Check any you want to normalize before processing:</div>`;
+      keys.forEach(k => {
+        const label = labels[k] || k;
+        const count = ws[k];
+        html += `<label class="ws-row">
+          <input type="checkbox" class="ws-cb" value="${k}" checked />
+          <span><strong>${label}</strong> — ${count} occurrence${count !== 1 ? "s" : ""}</span>
+        </label>`;
+      });
+
+      // Preview of first affected line
+      html += `<div class="ws-preview" id="ws-preview"></div>`;
+
+      document.getElementById("whitespace-content").innerHTML = html;
+
+      // Pre-select all
+      selectedNormalizations = keys.slice();
+      document.querySelectorAll(".ws-cb").forEach(cb => {
+        cb.addEventListener("change", () => {
+          selectedNormalizations = Array.from(document.querySelectorAll(".ws-cb:checked")).map(c => c.value);
+        });
+      });
+
+      showStep("step-whitespace");
+    }
+
+    function goToPatternStep() {
+      // Capture whitespace selections if we came from that step
+      const cbs = document.querySelectorAll(".ws-cb");
+      if (cbs.length > 0) {
+        selectedNormalizations = Array.from(document.querySelectorAll(".ws-cb:checked")).map(c => c.value);
+      }
       showPatternStep();
     }
 
@@ -445,23 +506,14 @@
       }
 
       const savePatternName = (document.getElementById("save-pattern-name")?.value || "").trim();
+      const payload = buildStartPayload(pattern, savePatternName);
 
       showLoading();
       try {
         const resp = await fetch("/api/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: document.getElementById("model-input").value.trim(),
-            grade: parseInt(document.getElementById("grade-input").value),
-            output_path: document.getElementById("output-input").value.trim() || setupData.output_path,
-            sentences_per_chunk: parseInt(document.getElementById("spc-input").value),
-            strip_header: stripHeader,
-            strip_footer: stripFooter,
-            pattern,
-            save_pattern_name: savePatternName,
-            resume: false,
-          }),
+          body: JSON.stringify(payload),
         });
         const data = await resp.json();
         hideLoading();
@@ -483,26 +535,78 @@
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     function showStep(id) {
-      ["step-settings", "step-resume", "step-boilerplate", "step-pattern"].forEach(s => {
+      ["step-settings", "step-resume", "step-boilerplate", "step-whitespace", "step-pattern"].forEach(s => {
         const el = document.getElementById(s);
         if (el) el.style.display = (s === id) ? "" : "none";
       });
       document.getElementById("loading-panel").style.display = "none";
       const labels = {
-        "step-settings": "Settings",
-        "step-resume": "Resume?",
-        "step-boilerplate": "Boilerplate",
-        "step-pattern": "Pattern",
+        "step-settings":   "Settings",
+        "step-resume":     "Resume?",
+        "step-boilerplate":"Boilerplate",
+        "step-whitespace": "Whitespace",
+        "step-pattern":    "Pattern",
       };
       document.getElementById("step-indicator").textContent = labels[id] || "";
     }
 
     function showLoading() {
-      ["step-settings", "step-resume", "step-boilerplate", "step-pattern"].forEach(s => {
+      ["step-settings", "step-resume", "step-boilerplate", "step-whitespace", "step-pattern"].forEach(s => {
         const el = document.getElementById(s);
         if (el) el.style.display = "none";
       });
       document.getElementById("loading-panel").style.display = "";
+    }
+
+    function buildStartPayload(pattern, savePatternName) {
+      return {
+        model: document.getElementById("model-input").value.trim(),
+        grade: parseInt(document.getElementById("grade-input").value),
+        output_path: document.getElementById("output-input").value.trim() || (setupData && setupData.output_path),
+        sentences_per_chunk: 1,  // always 1 sentence per chunk
+        strip_header: stripHeader,
+        strip_footer: stripFooter,
+        normalizations: selectedNormalizations,
+        pattern,
+        save_pattern_name: savePatternName || "",
+        resume: false,
+      };
+    }
+
+    async function editChapters() {
+      const errEl = document.getElementById("pattern-error");
+      errEl.style.display = "none";
+
+      let pattern = selectedPattern;
+      if (!pattern) {
+        const signals = Array.from(document.querySelectorAll(".signal-cb:checked")).map(el => el.value);
+        pattern = { logic: selectedLogic, signals };
+      }
+      const savePatternName = (document.getElementById("save-pattern-name")?.value || "").trim();
+      const payload = { ...buildStartPayload(pattern, savePatternName) };
+
+      showLoading();
+      try {
+        const resp = await fetch("/api/setup_chapters", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        hideLoading();
+        if (data.chapters) {
+          window.location.href = "/chapters";
+        } else {
+          errEl.textContent = data.error || "Failed to compute chapters.";
+          errEl.style.display = "";
+          showStep("step-pattern");
+        }
+      } catch (e) {
+        hideLoading();
+        errEl.textContent = "Network error: " + e.message;
+        errEl.style.display = "";
+        showStep("step-pattern");
+      }
     }
 
     function hideLoading() {

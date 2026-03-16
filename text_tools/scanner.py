@@ -14,17 +14,35 @@ SIGNALS = {
         "regex": re.compile(r"\n{3,}"),
     },
     "heading_lines": {
-        "description": "Keyword headings (Chapter, Part, etc.)",
-        "regex": re.compile(
-            r"^(Chapter|Part|Section|Book|Volume|Epilogue|Prologue|Introduction|Appendix)[\s\.\:\-]",
-            re.IGNORECASE | re.MULTILINE,
-        ),
+        "description": "Keyword headings (Chapter, Part N, etc.)",
+        "regex": None,  # handled by _is_heading_line()
     },
     "allcaps_lines": {
         "description": "ALL CAPS lines (3–80 chars)",
         "check": None,  # handled manually
     },
 }
+
+# General chapter keywords — match at start of line
+_HEADING_GENERAL_RE = re.compile(
+    r"^(Chapter|Section|Book|Volume|Epilogue|Prologue|Introduction|Appendix)\b",
+    re.IGNORECASE,
+)
+
+# "Part" is only a chapter divider when followed by a number/roman numeral/ordinal word,
+# NOT when it starts a normal sentence like "Part of the reason..." or "Partly because..."
+_HEADING_PART_RE = re.compile(
+    r"^\s*Part\s+(\d+|[IVXLCDMivxlcdm]{1,6}"
+    r"|one|two|three|four|five|six|seven|eight|nine|ten"
+    r"|eleven|twelve|first|second|third|fourth|fifth"
+    r"|sixth|seventh|eighth|ninth|tenth)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_heading_line(line: str) -> bool:
+    stripped = line.strip()
+    return bool(_HEADING_GENERAL_RE.match(stripped) or _HEADING_PART_RE.match(stripped))
 
 
 def _is_allcaps(line: str) -> bool:
@@ -53,7 +71,7 @@ def scan_signals(text: str) -> dict[str, list[int]]:
 
     # heading_lines
     for i, line in enumerate(lines):
-        if SIGNALS["heading_lines"]["regex"].match(line):
+        if _is_heading_line(line):
             result["heading_lines"].append(i)
 
     # allcaps_lines
