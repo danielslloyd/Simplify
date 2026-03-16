@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Text Simplifier — Chapter Splits</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container setup-container" style="max-width:720px">
+
+    <div class="header-bar">
+      <span class="section-label">Chapter Splits</span>
+      <span id="chapter-count" style="color:#aaa;font-size:0.85rem"></span>
+      <div class="nav-buttons">
+        <a href="/setup" class="btn btn-nav">← Back</a>
+      </div>
+    </div>
+
+    <!-- Search to add a split -->
+    <div class="panel">
+      <div class="panel-title">ADD SPLIT POINT</div>
+      <div class="ch-search-row">
+        <input type="text" id="search-input" placeholder="Search for text at the start of a new chapter…" />
+        <button class="btn btn-primary" onclick="findAndAdd()">Find &amp; Add</button>
+      </div>
+      <div id="search-result" class="ch-search-result" style="display:none"></div>
+      <div id="search-error" class="setup-error" style="display:none"></div>
+    </div>
+
+    <!-- Loading -->
+    <div class="panel loading-panel" id="loading-panel" style="display:none">
+      <div class="spinner"></div>
+      <span>Loading chapters…</span>
+    </div>
+
+    <!-- Chapter list -->
+    <div id="chapter-list"></div>
+
+    <!-- Bottom actions -->
+    <div class="action-bar" style="padding:8px 0">
+      <button class="btn btn-primary" onclick="startReviewing()">Start Reviewing →</button>
+      <a href="/setup" class="btn" style="margin-left:auto">← Back to Setup</a>
+    </div>
+
+  </div>
+
+  <script>
+    let chapters = [];
+    let pendingAddLine = null;
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+
+    document.addEventListener("DOMContentLoaded", loadChapters);
+
+    document.getElementById("search-input").addEventListener("keydown", e => {
+      if (e.key === "Enter") findAndAdd();
+    });
+
+    // ── Load chapters ─────────────────────────────────────────────────────────
+
+    async function loadChapters() {
+      document.getElementById("loading-panel").style.display = "";
+      document.getElementById("chapter-list").innerHTML = "";
+      try {
+        const resp = await fetch("/api/chapters");
+        const data = await resp.json();
+        document.getElementById("loading-panel").style.display = "none";
+        if (data.chapters) {
+          chapters = data.chapters;
+          renderChapters();
+        }
+      } catch (e) {
+        document.getElementById("loading-panel").style.display = "none";
+      }
+    }
+
+    // ── Render chapter list ───────────────────────────────────────────────────
+
+    function renderChapters() {
+      const list = document.getElementById("chapter-list");
+      document.getElementById("chapter-count").textContent =
+        chapters.length + " chapter" + (chapters.length !== 1 ? "s" : "");
+
+      list.innerHTML = chapters.map((ch, i) => {
+        const hasMore = ch.preview_end && ch.preview_start.length >= 200;
+        const previewHtml = hasMore
+          ? `<span class="ch-preview-start">${escHtml(ch.preview_start)}</span>`
+            + `<span class="ch-ellipsis"> … </span>`
+            + `<span class="ch-preview-end">${escHtml(ch.preview_end)}</span>`
+          : `<span class="ch-preview-start">${escHtml(ch.preview_start)}</span>`;
+
+        return `<details class="panel ch-chapter" id="ch-${i}">
+          <summary class="ch-summary">
+            <div class="ch-header">
+              <span class="ch-title">${escHtml(ch.title)}</span>
+              <span class="ch-meta">${ch.sentence_count} sentence${ch.sentence_count !== 1 ? "s" : ""} · lines ${ch.start_line + 1}–${ch.end_line + 1}</span>
+              ${i > 0 ? `<button class="btn-icon ch-remove" title="Remove this chapter break" onclick="removeSplit(event, ${ch.start_line})">✕ Remove break</button>` : ""}
+            </div>
+            <div class="ch-preview">${previewHtml}</div>
+          </summary>
+          <div class="ch-full-content" id="ch-full-${i}">
+            <div class="ch-preview-start ch-full-text">${escHtml(ch.preview_start + (hasMore ? " … " + ch.preview_end : ""))}</div>
+          </div>
+        </details>`;
+      }).join("");
+    }
+
+    // ── Remove a split ────────────────────────────────────────────────────────
+
+    async function removeSplit(event, startLine) {
+      event.preventDefault();
+      event.stopPropagation();
+      const resp = await fetch("/api/chapters/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line: startLine }),
+      });
+      const data = await resp.json();
+      if (data.chapters) {
+        chapters = data.chapters;
+        renderChapters();
+      }
+    }
+
+    // ── Find and add a split ──────────────────────────────────────────────────
+
+    async function findAndAdd() {
+      const query = document.getElementById("search-input").value.trim();
+      const errEl = document.getElementById("search-error");
+      const resultEl = document.getElementById("search-result");
+      errEl.style.display = "none";
+      resultEl.style.display = "none";
+      pendingAddLine = null;
+
+      if (!query) {
+        errEl.textContent = "Enter text to search for.";
+        errEl.style.display = "";
+        return;
+      }
+
+      const resp = await fetch("/api/chapters/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ search: query }),
+      });
+      const data = await resp.json();
+
+      if (data.line === null || data.line === undefined) {
+        errEl.textContent = `"${query}" not found in the text.`;
+        errEl.style.display = "";
+        return;
+      }
+
+      pendingAddLine = data.line;
+      resultEl.innerHTML = `Found at line ${data.line + 1}:<pre class="ch-context">${escHtml(data.context)}</pre>
+        <button class="btn btn-primary" onclick="confirmAdd()">Add split here</button>
+        <button class="btn" onclick="cancelAdd()" style="margin-left:6px">Cancel</button>`;
+      resultEl.style.display = "";
+    }
+
+    async function confirmAdd() {
+      if (pendingAddLine === null) return;
+      const resp = await fetch("/api/chapters/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line: pendingAddLine }),
+      });
+      const data = await resp.json();
+      pendingAddLine = null;
+      document.getElementById("search-result").style.display = "none";
+      document.getElementById("search-input").value = "";
+      if (data.chapters) {
+        chapters = data.chapters;
+        renderChapters();
+      }
+    }
+
+    function cancelAdd() {
+      pendingAddLine = null;
+      document.getElementById("search-result").style.display = "none";
+    }
+
+    // ── Start reviewing ───────────────────────────────────────────────────────
+
+    async function startReviewing() {
+      const resp = await fetch("/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resume: false }),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        window.location.href = "/";
+      } else {
+        alert(data.error || "Failed to start session.");
+      }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    function escHtml(str) {
+      return String(str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+  </script>
+</body>
+</html>

@@ -18,8 +18,9 @@ def _get_split_line_numbers(text: str, signals: dict, pattern: dict) -> list[int
 def chunk_text(
     text: str,
     pattern: dict,
-    sentences_per_chunk: int = 5,
+    sentences_per_chunk: int = 1,
     signals: dict = None,
+    override_splits: list[int] | None = None,
 ) -> list[dict]:
     """
     Split text into labeled sections and sentence-based chunks.
@@ -39,7 +40,7 @@ def chunk_text(
         signals = scan_signals(text)
 
     lines = text.splitlines()
-    split_line_numbers = _get_split_lines(text, signals, pattern)
+    split_line_numbers = override_splits if override_splits is not None else _get_split_lines(text, signals, pattern)
 
     # Build sections: list of (label, text_content)
     sections = []
@@ -76,27 +77,23 @@ def chunk_text(
 
     # Build chunks
     chunks = []
-    global_index = 0
 
-    # First pass: build all chunks to get total count
-    raw_chunks = []
+    raw_chunks_final = []
     for section_idx, (section_label, section_text) in enumerate(sections):
         sentences = nltk.sent_tokenize(section_text)
-        # Group into chunks of N sentences
-        for i in range(0, len(sentences), sentences_per_chunk):
-            group = sentences[i:i + sentences_per_chunk]
-            chunk_text_str = " ".join(group).strip()
-            if not chunk_text_str:
+        for sent_idx, sentence in enumerate(sentences):
+            sentence = sentence.strip()
+            if not sentence:
                 continue
-            raw_chunks.append({
+            raw_chunks_final.append({
                 "section": section_label,
                 "section_index": section_idx,
-                "chunk_index": i // sentences_per_chunk,
-                "original": chunk_text_str,
+                "chunk_index": sent_idx,
+                "original": sentence,
             })
 
-    total = len(raw_chunks)
-    for gi, rc in enumerate(raw_chunks):
+    total = len(raw_chunks_final)
+    for gi, rc in enumerate(raw_chunks_final):
         rc["global_index"] = gi
         rc["total_chunks"] = total
         chunks.append(rc)

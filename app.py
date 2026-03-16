@@ -9,8 +9,6 @@ import webbrowser
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 
-from llm.flagger import flag_chunk
-from llm.suggester import get_suggestion
 from output.writer import save_session, export
 
 app = Flask(__name__)
@@ -161,6 +159,21 @@ def api_setup():
         "sentences_per_chunk": sentences_per_chunk,
     }
 
+    # Whitespace analysis
+    whitespace = {}
+    if "\r\n" in raw_text:
+        whitespace["crlf"] = raw_text.count("\r\n")
+    bare_cr = raw_text.replace("\r\n", "").count("\r")
+    if bare_cr:
+        whitespace["cr"] = bare_cr
+    if "\t" in raw_text:
+        whitespace["tabs"] = raw_text.count("\t")
+    if "\u00a0" in raw_text:
+        whitespace["nbsp"] = raw_text.count("\u00a0")
+    zw = sum(raw_text.count(c) for c in "\u200b\u200c\u200d\ufeff")
+    if zw:
+        whitespace["zero_width"] = zw
+
     return jsonify({
         "boilerplate": boilerplate,
         "signals": signals_summary,
@@ -168,6 +181,7 @@ def api_setup():
         "existing_session": existing_session,
         "output_path": output_path,
         "filename": filename,
+        "whitespace": whitespace,
     })
 
 
@@ -218,19 +232,27 @@ def api_start():
             _config = {"model": model, "grade": grade, "output_path": output_path}
             return jsonify({"ok": True})
 
-    raw_text = _pending["raw_text"]
-
-    # Strip boilerplate
-    from text_tools.boilerplate import detect_boilerplate, strip_boilerplate
-    if strip_header or strip_footer:
-        regions = detect_boilerplate(raw_text)
-        confirmed = {
-            "header": regions.get("header") if strip_header else None,
-            "footer": regions.get("footer") if strip_footer else None,
-        }
-        clean_text = strip_boilerplate(raw_text, confirmed)
+    # Use pre-processed text from chapter editor if available, else process from raw
+    if "clean_text" in _pending:
+        clean_text = _pending["clean_text"]
+        override_splits = _pending.get("current_splits")
     else:
-        clean_text = raw_text
+        raw_text = _pending["raw_text"]
+        normalizations = data.get("normalizations", [])
+
+        from text_tools.boilerplate import detect_boilerplate, strip_boilerplate
+        if strip_header or strip_footer:
+            regions = detect_boilerplate(raw_text)
+            confirmed = {
+                "header": regions.get("header") if strip_header else None,
+                "footer": regions.get("footer") if strip_footer else None,
+            }
+            clean_text = strip_boilerplate(raw_text, confirmed)
+        else:
+            clean_text = raw_text
+
+        clean_text = _apply_normalizations(clean_text, normalizations)
+        override_splits = None
 
     # Optionally save pattern
     if save_pattern_name:
@@ -242,7 +264,7 @@ def api_start():
     from text_tools.chunker import chunk_text
     from text_tools.scanner import scan_signals
     signals = scan_signals(clean_text)
-    chunks = chunk_text(clean_text, pattern, sentences_per_chunk=sentences_per_chunk, signals=signals)
+    chunks = chunk_text(clean_text, pattern, signals=signals, override_splits=override_splits)
 
     if not chunks:
         return jsonify({"error": "No chunks produced from this text."}), 400
@@ -287,7 +309,7 @@ def review(chunk_index: int):
 
 @app.route("/api/flags/<int:chunk_index>")
 def api_flags(chunk_index: int):
-    """Return flags + suggestions for a chunk. Triggers LLM if not yet cached."""
+    """Analyze sentence with LLM if not yet cached; return tier + suggestion + prompt."""
     chunk = _get_chunk(chunk_index)
     if chunk is None:
         return jsonify({"error": "Chunk not found"}), 404
@@ -296,70 +318,61 @@ def api_flags(chunk_index: int):
     grade = _config["grade"]
     output_path = _config["output_path"]
 
-    # If flags not yet fetched, call LLM
-    if "flags" not in chunk or chunk.get("flags") is None:
+    if chunk.get("tier") is None:
+        from llm.analyzer import analyze_sentence
         try:
-            flags = flag_chunk(model, chunk["original"], grade)
+            result = analyze_sentence(model, chunk["original"], grade)
         except ConnectionError as e:
             return jsonify({"error": str(e), "type": "connection"}), 503
         except ValueError as e:
             return jsonify({"error": str(e), "type": "model"}), 422
 
-        chunk["flags"] = flags
+        chunk["tier"] = result["tier"]
+        chunk["reason"] = result["reason"]
+        chunk["suggestion"] = result["suggestion"]
+        chunk["prompt"] = result["prompt"]
+        chunk["action"] = "pending"
+        chunk["final_text"] = None
         save_session(_session, output_path)
 
-    flags = chunk.get("flags", [])
-
-    # Check for flag_error
-    if flags and flags[0].get("flag_error"):
-        return jsonify({"flag_error": True, "flags": []})
-
-    # Fill suggestions for flags that don't have one yet
-    for flag in flags:
-        if flag.get("suggestion") is None and flag.get("action") == "pending":
-            try:
-                flag["suggestion"] = get_suggestion(model, flag["span"], grade)
-            except Exception:
-                flag["suggestion"] = ""
-
-    save_session(_session, output_path)
-    return jsonify({"flags": flags})
+    return jsonify({
+        "tier": chunk.get("tier"),
+        "reason": chunk.get("reason", ""),
+        "suggestion": chunk.get("suggestion"),
+        "prompt": chunk.get("prompt", ""),
+        "action": chunk.get("action", "pending"),
+    })
 
 
 @app.route("/api/action", methods=["POST"])
 def api_action():
-    """Record an action for a flag: {chunk_index, span, action, final_text}"""
+    """Record sentence-level action: {chunk_index, action, final_text}"""
     data = request.get_json()
     chunk_index = data.get("chunk_index")
-    span = data.get("span")
-    action = data.get("action")
+    action = data.get("action")       # "approved" | "kept" | "edited"
     final_text = data.get("final_text")
 
     chunk = _get_chunk(chunk_index)
     if chunk is None:
         return jsonify({"error": "Chunk not found"}), 404
 
-    for flag in chunk.get("flags", []):
-        if flag.get("span") == span:
-            flag["action"] = action
-            flag["final_text"] = final_text
-            break
-
-    # Rebuild preview text
-    chunk["final_text"] = _apply_flags(chunk)
+    chunk["action"] = action
+    chunk["final_text"] = final_text
     save_session(_session, _config["output_path"])
-    return jsonify({"ok": True, "preview": chunk["final_text"]})
+    return jsonify({"ok": True})
 
 
 @app.route("/api/complete/<int:chunk_index>", methods=["POST"])
 def api_complete(chunk_index: int):
-    """Mark chunk complete and persist session."""
+    """Mark sentence complete and persist session."""
     chunk = _get_chunk(chunk_index)
     if chunk is None:
         return jsonify({"error": "Chunk not found"}), 404
 
+    if chunk.get("final_text") is None:
+        chunk["final_text"] = chunk.get("original", "")
+
     chunk["status"] = "complete"
-    chunk["final_text"] = _apply_flags(chunk)
     save_session(_session, _config["output_path"])
 
     next_index = chunk_index + 1
@@ -369,34 +382,18 @@ def api_complete(chunk_index: int):
     return jsonify({"ok": True, "done": False, "next": next_index})
 
 
-@app.route("/api/suggest/<int:chunk_index>/<path:span>", methods=["POST"])
-def api_suggest(chunk_index: int, span: str):
-    """Re-request suggestion for a rejected span."""
-    model = _config["model"]
-    grade = _config["grade"]
-
-    # Clear cache for this span to force a new suggestion
-    from llm.suggester import _cache
-    key = (span.lower(), grade)
-    _cache.pop(key, None)
-
-    try:
-        suggestion = get_suggestion(model, span, grade)
-    except ConnectionError as e:
-        return jsonify({"error": str(e)}), 503
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 422
-
-    # Update in session
+@app.route("/api/reanalyze/<int:chunk_index>", methods=["POST"])
+def api_reanalyze(chunk_index: int):
+    """Force a fresh LLM analysis for this sentence."""
     chunk = _get_chunk(chunk_index)
-    if chunk:
-        for flag in chunk.get("flags", []):
-            if flag.get("span") == span:
-                flag["suggestion"] = suggestion
-                break
-        save_session(_session, _config["output_path"])
+    if chunk is None:
+        return jsonify({"error": "Chunk not found"}), 404
 
-    return jsonify({"suggestion": suggestion})
+    # Clear cached result
+    for key in ("tier", "reason", "suggestion", "prompt", "action", "final_text"):
+        chunk.pop(key, None)
+
+    return api_flags(chunk_index)
 
 
 @app.route("/api/export", methods=["POST"])
@@ -409,7 +406,8 @@ def api_export():
 
 @app.route("/api/auto_complete_rest", methods=["POST"])
 def api_auto_complete_rest():
-    """Auto-complete all remaining chunks (red/yellow auto-approved, green skipped)."""
+    """Auto-complete all remaining sentences (red/yellow → accept suggestion, green → keep)."""
+    from llm.analyzer import analyze_sentence
     model = _config["model"]
     grade = _config["grade"]
     output_path = _config["output_path"]
@@ -417,29 +415,24 @@ def api_auto_complete_rest():
     for chunk in _session.get("chunks", []):
         if chunk.get("status") == "complete":
             continue
-        if "flags" not in chunk or chunk.get("flags") is None:
+        if chunk.get("tier") is None:
             try:
-                chunk["flags"] = flag_chunk(model, chunk["original"], grade)
+                result = analyze_sentence(model, chunk["original"], grade)
+                chunk.update(result)
             except Exception:
-                chunk["flags"] = []
+                chunk["tier"] = "green"
+                chunk["reason"] = ""
+                chunk["suggestion"] = None
+                chunk["prompt"] = ""
 
-        for flag in chunk.get("flags", []):
-            if flag.get("flag_error"):
-                continue
-            tier = flag.get("tier", "green")
-            if tier in ("red", "yellow"):
-                if flag.get("suggestion") is None:
-                    try:
-                        flag["suggestion"] = get_suggestion(model, flag["span"], grade)
-                    except Exception:
-                        flag["suggestion"] = flag["span"]
-                flag["action"] = "approved"
-                flag["final_text"] = flag["suggestion"]
-            else:
-                flag["action"] = "skipped"
-                flag["final_text"] = flag["span"]
+        tier = chunk.get("tier", "green")
+        if tier in ("red", "yellow") and chunk.get("suggestion"):
+            chunk["action"] = "approved"
+            chunk["final_text"] = chunk["suggestion"]
+        else:
+            chunk["action"] = "kept"
+            chunk["final_text"] = chunk["original"]
 
-        chunk["final_text"] = _apply_flags(chunk)
         chunk["status"] = "complete"
 
     save_session(_session, output_path)
@@ -447,14 +440,163 @@ def api_auto_complete_rest():
     return jsonify({"ok": True})
 
 
-def _apply_flags(chunk: dict) -> str:
-    """Apply approved/edited flag actions to the original text to produce final_text."""
-    text = chunk.get("original", "")
-    for flag in chunk.get("flags", []):
-        if flag.get("flag_error"):
+# ── Chapter editor ─────────────────────────────────────────────────────────────
+
+def _chapter_list_from_pending() -> list[dict]:
+    """Compute chapter list from _pending state (clean_text + current_splits)."""
+    import nltk
+    text = _pending.get("clean_text") or _pending.get("raw_text", "")
+    splits = _pending.get("current_splits", [])
+    lines = text.splitlines()
+
+    boundaries = sorted(set(splits)) + [len(lines)]
+    chapters = []
+    prev = 0
+
+    for boundary in boundaries:
+        chunk_lines = lines[prev:boundary]
+        content = "\n".join(chunk_lines).strip()
+        if not content:
+            prev = boundary
             continue
-        action = flag.get("action", "pending")
-        span = flag.get("span", "")
-        if action in ("approved", "edited") and flag.get("final_text"):
-            text = text.replace(span, flag["final_text"], 1)
+
+        title = next((l.strip() for l in chunk_lines if l.strip()), f"Section {len(chapters) + 1}")
+        sentences = nltk.sent_tokenize(content)
+        preview_start = content[:200]
+        preview_end = content[-100:] if len(content) > 300 else ""
+
+        chapters.append({
+            "index": len(chapters),
+            "title": title,
+            "start_line": prev,
+            "end_line": boundary - 1,
+            "sentence_count": len(sentences),
+            "preview_start": preview_start,
+            "preview_end": preview_end,
+        })
+        prev = boundary
+
+    return chapters
+
+
+def _apply_normalizations(text: str, normalizations: list[str]) -> str:
+    if "crlf" in normalizations:
+        text = text.replace("\r\n", "\n")
+    if "cr" in normalizations:
+        text = text.replace("\r", "\n")
+    if "tabs" in normalizations:
+        text = text.replace("\t", " ")
+    if "nbsp" in normalizations:
+        text = text.replace("\u00a0", " ")
+    if "zero_width" in normalizations:
+        for ch in "\u200b\u200c\u200d\ufeff":
+            text = text.replace(ch, "")
     return text
+
+
+@app.route("/api/setup_chapters", methods=["POST"])
+def api_setup_chapters():
+    """Store setup choices and compute initial chapter splits. Called before /chapters."""
+    global _pending
+    if not _pending.get("raw_text"):
+        return jsonify({"error": "No file loaded."}), 400
+
+    data = request.get_json() or {}
+    strip_header = data.get("strip_header", False)
+    strip_footer = data.get("strip_footer", False)
+    normalizations = data.get("normalizations", [])
+    pattern = data.get("pattern", {"logic": "OR", "signals": []})
+    model = data.get("model") or _pending.get("model", "llama3")
+    grade = int(data.get("grade") or _pending.get("grade", 6))
+    output_path = data.get("output_path") or _pending.get("output_path", "./output/simplified")
+    spc = int(data.get("sentences_per_chunk") or _pending.get("sentences_per_chunk", 1))
+
+    raw_text = _pending["raw_text"]
+
+    # Strip boilerplate
+    from text_tools.boilerplate import detect_boilerplate, strip_boilerplate
+    if strip_header or strip_footer:
+        regions = detect_boilerplate(raw_text)
+        confirmed = {
+            "header": regions.get("header") if strip_header else None,
+            "footer": regions.get("footer") if strip_footer else None,
+        }
+        clean_text = strip_boilerplate(raw_text, confirmed)
+    else:
+        clean_text = raw_text
+
+    clean_text = _apply_normalizations(clean_text, normalizations)
+
+    # Compute initial splits from pattern
+    from text_tools.scanner import scan_signals, _get_split_lines
+    signals = scan_signals(clean_text)
+    splits = _get_split_lines(clean_text, signals, pattern)
+
+    _pending.update({
+        "clean_text": clean_text,
+        "current_splits": splits,
+        "model": model,
+        "grade": grade,
+        "output_path": output_path,
+        "sentences_per_chunk": spc,
+        "pattern": pattern,
+    })
+
+    return jsonify({"chapters": _chapter_list_from_pending()})
+
+
+@app.route("/chapters")
+def chapters_page():
+    if not _pending.get("raw_text"):
+        return redirect(url_for("setup"))
+    return render_template("chapters.html")
+
+
+@app.route("/api/chapters")
+def api_chapters():
+    if not _pending.get("raw_text"):
+        return jsonify({"error": "No file loaded."}), 400
+    return jsonify({"chapters": _chapter_list_from_pending()})
+
+
+@app.route("/api/chapters/add", methods=["POST"])
+def api_chapters_add():
+    data = request.get_json() or {}
+    line = data.get("line")
+    if line is None:
+        return jsonify({"error": "line required"}), 400
+    splits = list(_pending.get("current_splits", []))
+    if line not in splits:
+        splits.append(line)
+        splits.sort()
+    _pending["current_splits"] = splits
+    return jsonify({"chapters": _chapter_list_from_pending()})
+
+
+@app.route("/api/chapters/remove", methods=["POST"])
+def api_chapters_remove():
+    data = request.get_json() or {}
+    line = data.get("line")
+    if line is None:
+        return jsonify({"error": "line required"}), 400
+    splits = [s for s in _pending.get("current_splits", []) if s != line]
+    _pending["current_splits"] = splits
+    return jsonify({"chapters": _chapter_list_from_pending()})
+
+
+@app.route("/api/chapters/search", methods=["POST"])
+def api_chapters_search():
+    data = request.get_json() or {}
+    query_text = (data.get("search") or "").strip().lower()
+    if not query_text:
+        return jsonify({"error": "search text required"}), 400
+
+    text = _pending.get("clean_text") or _pending.get("raw_text", "")
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if query_text in line.lower():
+            start = max(0, i - 1)
+            context_lines = lines[start:i + 2]
+            return jsonify({"line": i, "context": "\n".join(context_lines)})
+
+    return jsonify({"line": None, "context": ""})
